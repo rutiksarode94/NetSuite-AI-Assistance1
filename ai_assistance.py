@@ -136,8 +136,29 @@ If the user didn't specify a subtype, omit the "type" filter and just search acr
 
 **Field reference by category (use for BOTH filters and columns):**
 - Entity Records (customer, vendor): companyname, email, phone, subsidiary, isinactive, datecreated, lastmodifieddate
-- Item Records: itemid, displayname, type, isinactive, quantityonhand, baseprice, cost
+- Item Records (general): itemid, displayname, type, isinactive, quantityonhand, cost
 - Transaction Records: tranid, trandate, entity, mainline, status, amount, type
+
+**⚠️ ITEM PRICE HAS TWO DIFFERENT FIELD IDs — one for filters, one for columns. Using the wrong one causes a "invalid search criteria" error. Both are plain (non-joined) fields — do NOT use join/object syntax for price.**
+- In "filters" (native saved-search criteria), the price field is **"price"** (labeled "Sales Price"). NEVER use "baseprice" inside "filters" — NetSuite does not accept it there.
+- In "columns" (native saved-search results), the price field is **"baseprice"** (labeled "Base Price"). Use "baseprice", not "price", when displaying price as a column.
+- All filter/column entries are plain `[fieldId, operator, value]` triplets (for filters) or plain string field IDs (for columns) — never use an object/join syntax for price or any other item field.
+
+**Example — item price filter (correct):**
+"filters": [
+  ["type", "anyof", "NonInvtPart"],
+  "AND",
+  ["isinactive", "is", "F"],
+  "AND",
+  ["price", "greaterthan", "1000"]
+],
+"columns": ["internalid", "itemid", "displayname", "baseprice"]
+
+**For SuiteQL ("query"), there is no flat "price" or "baseprice" column on the item table — price must come from a JOIN to the separate "pricing" table (pricelevel = 1 is Base Price):**
+  SELECT item.id, item.itemid, item.displayname, pricing.unitprice
+  FROM item
+  JOIN pricing ON pricing.item = item.id AND pricing.pricelevel = 1
+  WHERE item.itemtype = 'NonInvtPart' AND item.isinactive = 'F' AND pricing.unitprice > 1000
 
 **Value rules — NEVER use static/example numbers or dates. Always derive values from what the user actually typed in their message.** (e.g. if the user says "over 1000", use "1000"; if they say "over 500", use "500" — do not default to a fixed number.)
 
@@ -210,15 +231,15 @@ For Search (native saved-search filters, with SuiteQL fallback):
         "AND",
         ["isinactive", "is", "F"],
         "AND",
-        ["baseprice", "greaterthan", "1000"]
+        ["price", "greaterthan", "1000"]
       ],
       "columns": ["internalid", "itemid", "displayname", "baseprice"],
       "searchname": "Non-Inventory Items Over 1000",
-      "query": "SELECT id, itemid, displayname, baseprice FROM item WHERE itemtype = 'NonInvtPart' AND isinactive = 'F' AND baseprice > 1000 LIMIT 50"
+      "query": "SELECT item.id, item.itemid, item.displayname, pricing.unitprice FROM item JOIN pricing ON pricing.item = item.id AND pricing.pricelevel = 1 WHERE item.itemtype = 'NonInvtPart' AND item.isinactive = 'F' AND pricing.unitprice > 1000 LIMIT 50"
     }
   }]
 }
-(Note: the "1000" above is only an example because the user's message mentioned 1000 — always substitute the actual number/value from the user's own message, never reuse this example value.)
+(Note: "1000" above is only an example because the user's message mentioned 1000 — always substitute the actual number/value from the user's own message. Note the filter field is "price" but the column field is "baseprice" — they are different IDs for the same concept.)
 
 **Important:**
 - Never use "item" as a "recordtype" value — always specify "noninventoryitem", "inventoryitem", or "serviceitem" there.

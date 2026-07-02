@@ -8,14 +8,16 @@ define([
     'N/record', 
     'N/url', 
     'N/search', 
-    'N/runtime'
+    'N/runtime',
+    'N/query'
 ], (
     https, 
     log, 
     record, 
     url, 
     search, 
-    runtime
+    runtime,
+    query
 ) => {
 
     const post = (requestBody) => {
@@ -251,6 +253,41 @@ define([
     //         };
     //     }
     // }
+// Converts the AI's JSON filter/column descriptors into real search.Filter / search.Column
+// objects where needed. search.create() accepts plain [name, operator, value] triplet arrays
+// and "AND"/"OR" strings natively, but a JOINED field (e.g. price, which lives on the item's
+// "pricing" sublist) must be built explicitly via search.createFilter()/search.createColumn() —
+// a plain {name, join, ...} object is not automatically understood by search.create().
+function buildFilters(filters) {
+    if (!Array.isArray(filters)) return [];
+    return filters.map(f => {
+        if (typeof f === 'string') return f; // "AND" / "OR"
+        if (Array.isArray(f)) return f;       // plain [name, operator, value] triplet
+        if (f && typeof f === 'object' && f.name) {
+            // Joined filter descriptor, e.g. { name: 'unitprice', join: 'pricing', operator: 'greaterthan', values: ['1000'] }
+            return search.createFilter({
+                name: f.name,
+                join: f.join,
+                operator: f.operator,
+                values: f.values
+            });
+        }
+        return f;
+    });
+}
+
+function buildColumns(columns) {
+    if (!Array.isArray(columns) || columns.length === 0) return ['internalid'];
+    return columns.map(c => {
+        if (typeof c === 'string') return c; // plain field id
+        if (c && typeof c === 'object' && c.name) {
+            // Joined column descriptor, e.g. { name: 'unitprice', join: 'pricing' }
+            return search.createColumn({ name: c.name, join: c.join, label: c.label });
+        }
+        return c;
+    });
+}
+
 function searchRecord(data) {
     const { recordtype, searchtype, filters = [], columns = [], searchname = "AI Search" } = data;
     if (!recordtype) return { success: false };
@@ -260,10 +297,8 @@ function searchRecord(data) {
     // Fall back to recordtype only if the AI omitted searchtype (e.g. custom records).
     const effectiveSearchType = searchtype || recordtype;
 
-    // Columns must come from the AI response — never hardcode to just internalid.
-    const effectiveColumns = (Array.isArray(columns) && columns.length > 0)
-        ? columns
-        : ['internalid'];
+    const effectiveFilters = buildFilters(filters);
+    const effectiveColumns = buildColumns(columns);
 
     try {
         const accountId = runtime.accountId;
@@ -271,7 +306,7 @@ function searchRecord(data) {
         const savedSearch = search.create({
             type: effectiveSearchType,
             title: `${searchname} - ${new Date().toISOString().slice(0,16)}`,
-            filters: filters,
+            filters: effectiveFilters,
             columns: effectiveColumns
         });
 
@@ -295,8 +330,7 @@ function searchRecord(data) {
             searchName: savedSearch.title,
             searchId: searchId,
             count: resultCount,
-            searchLink: searchLink,
-            columns: effectiveColumns
+            searchLink: searchLink
         };
     } catch (e) {
         log.error('Saved Search Failed - Using SuiteQL from AI', e.message);
@@ -306,30 +340,26 @@ function searchRecord(data) {
 
 // Execute SuiteQL Query from AI
 function executeSuiteQL(data) {
-    const { recordtype, searchtype, searchname = "AI Search", query } = data;
+    const { recordtype, searchtype, searchname = "AI Search", query: aiQuery } = data;
     const accountId = runtime.accountId;
     const effectiveSearchType = searchtype || recordtype;
 
     try {
-        log.debug('Executing SuiteQL', query);
         // Fallback query, if the AI didn't provide one, must use the "item" table for item
         // searchtypes (matches the SuiteQL rules in the system prompt) instead of recordtype.
         const fallbackTable = effectiveSearchType === 'item' ? 'item'
             : effectiveSearchType === 'transaction' ? 'transaction'
             : effectiveSearchType;
-        let sql = query || `SELECT id, ${fallbackTable === 'item' ? 'itemid, displayname' : 'entityid'} FROM ${fallbackTable} WHERE isinactive = 'F' LIMIT 50`;
+        let sql = aiQuery || `SELECT id, ${fallbackTable === 'item' ? 'itemid, displayname' : 'entityid'} FROM ${fallbackTable} WHERE isinactive = 'F' LIMIT 50`;
 
-        const suiteQLResult = search.create({
-            type: search.Type.FREEFORM,
-            query: sql
-        }).run();
+        log.debug('Executing SuiteQL', sql);
 
-        log.debug('SuiteQL ResultSet', suiteQLResult);
-        const results = suiteQLResult.getRange({ start: 0, end: 50 });
+        // Raw SuiteQL must run through N/query — search.create({type: search.Type.FREEFORM})
+        // is NOT a valid SuiteScript API and always throws "Missing a required argument: type".
+        const mappedResults = query.runSuiteQL({ query: sql }).asMappedResults();
 
-        // Read whichever columns actually came back from the query, instead of
-        // hardcoding a fixed field name — the SELECT list is fully dynamic from the AI.
-        const columnNames = suiteQLResult.columns.map(c => c.name);
+        log.debug('SuiteQL Mapped Results', mappedResults);
+        const results = mappedResults.slice(0, 50);
 
         const searchLink = `https://${accountId}.app.netsuite.com/app/common/search/savedsearchresults.nl?searchtype=${effectiveSearchType}`;
 
@@ -342,13 +372,9 @@ function executeSuiteQL(data) {
             searchId: null,
             count: results.length,
             searchLink: searchLink,
-            results: results.map(r => {
-                const row = { id: r.id };
-                columnNames.forEach(col => {
-                    row[col] = r.getValue({ name: col });
-                });
-                return row;
-            })
+            // asMappedResults() already returns plain objects keyed by column/alias name,
+            // lowercased — no manual column mapping needed.
+            results: results
         };
     } catch (e) {
         log.error('SuiteQL Execution Failed', e);
