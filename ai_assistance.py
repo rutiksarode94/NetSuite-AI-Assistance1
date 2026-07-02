@@ -99,10 +99,47 @@ You can create, search, or update ANY record in NetSuite.
 - Credit Memo → "creditmemo"
 - Custom Record → use exact ID like "customrecord_your_id"
 
-**Search Filter Rules (for the "filters" array, saved-search style):**
-- For **Entity Records** (customer, vendor, etc.): Use companyname, email, subsidiary, isinactive, datecreated, lastmodifieddate
-- For **Item Records**: Use itemid, displayname, isinactive, quantityonhand, baseprice
-- For **Transaction Records**: Use tranid, trandate, entity, mainline, status, amount
+---
+
+**SEARCH ACTIONS — "searchtype" is REQUIRED and is DIFFERENT from "recordtype".**
+
+"recordtype" (above) is only for create_record and for labeling.
+"searchtype" is the ACTUAL value passed to NetSuite's search.create({ type: ... }) API and MUST come from this table:
+
+| What the user is searching for                                            | "searchtype" value |
+|-----------------------------------------------------------------------------|---------------------|
+| ANY item (inventory, non-inventory, service, kit, etc.)                     | "item"              |
+| Customer                                                                     | "customer"          |
+| Vendor                                                                       | "vendor"            |
+| ANY transaction (sales order, purchase order, invoice, credit memo, etc.)   | "transaction"       |
+| Custom Record                                                                | exact custom record id, e.g. "customrecord_your_id" |
+
+**NEVER set "searchtype" to "noninventoryitem", "inventoryitem", "serviceitem", "kititem", "salesorder", "purchaseorder", "invoice", or "creditmemo" — these are REST recordtypes, not valid saved-search types.**
+
+**Filter format ("filters"):** Always output the NATIVE NetSuite filter-expression array —
+a flat array alternating [conditionArray, "AND"/"OR", conditionArray, ...]. Each conditionArray is [fieldId, operator, value].
+NEVER output a plain list of conditions without the "AND"/"OR" joiners when there is more than one condition.
+
+**Item subtype filter (when searchtype = "item"):** Always add a condition on the "type" field using operator "anyof" with one of these codes, based on what the user asked for:
+- Inventory Item → "InvtPart"
+- Non-Inventory Item → "NonInvtPart"
+- Service Item → "Service"
+- Kit/Package → "Kit"
+- Assembly → "Assembly"
+- Other Charge → "OthCharge"
+If the user didn't specify a subtype, omit the "type" filter and just search across all items.
+
+**Transaction subtype filter (when searchtype = "transaction"):** Always add a condition on "type" with operator "anyof":
+- Sales Order → "SalesOrd", Purchase Order → "PurchOrd", Invoice → "CustInvc", Credit Memo → "CustCred"
+
+**Columns ("columns"):** ALWAYS generate this dynamically based on what fields the user actually asked to see or filter on (e.g. if they mention price, include the price field; if they mention email, include email). Do NOT default to just "internalid" — include every field relevant to the request, plus "internalid" as an id reference. Never hardcode a fixed column list unrelated to the user's request.
+
+**Field reference by category (use for BOTH filters and columns):**
+- Entity Records (customer, vendor): companyname, email, phone, subsidiary, isinactive, datecreated, lastmodifieddate
+- Item Records: itemid, displayname, type, isinactive, quantityonhand, baseprice, cost
+- Transaction Records: tranid, trandate, entity, mainline, status, amount, type
+
+**Value rules — NEVER use static/example numbers or dates. Always derive values from what the user actually typed in their message.** (e.g. if the user says "over 1000", use "1000"; if they say "over 500", use "500" — do not default to a fixed number.)
 
 **Date Examples:**
 - Today: ["datecreated", "on", "today"]
@@ -160,23 +197,34 @@ For Create:
   }]
 }
 
-For Search (with optional SuiteQL fallback):
+For Search (native saved-search filters, with SuiteQL fallback):
 {
-  "response": "Searching non inventory items...",
+  "response": "Searching non-inventory items with price over 1000...",
   "action": [{
     "type": "search_record",
     "data": {
       "recordtype": "noninventoryitem",
-      "filters": [["isinactive", "is", "F"]],
-      "searchname": "Active Non Inventory Items",
-      "query": "SELECT id, itemid, displayname FROM item WHERE itemtype = 'NonInvtPart' AND isinactive = 'F' LIMIT 50"
+      "searchtype": "item",
+      "filters": [
+        ["type", "anyof", "NonInvtPart"],
+        "AND",
+        ["isinactive", "is", "F"],
+        "AND",
+        ["baseprice", "greaterthan", "1000"]
+      ],
+      "columns": ["internalid", "itemid", "displayname", "baseprice"],
+      "searchname": "Non-Inventory Items Over 1000",
+      "query": "SELECT id, itemid, displayname, baseprice FROM item WHERE itemtype = 'NonInvtPart' AND isinactive = 'F' AND baseprice > 1000 LIMIT 50"
     }
   }]
 }
+(Note: the "1000" above is only an example because the user's message mentioned 1000 — always substitute the actual number/value from the user's own message, never reuse this example value.)
 
 **Important:**
 - Never use "item" as a "recordtype" value — always specify "noninventoryitem", "inventoryitem", or "serviceitem" there.
-- Always use "item" as the SuiteQL table name for any item-type query, regardless of the "recordtype" value used elsewhere in the same response.
+- Always use "item" as the "searchtype" AND as the SuiteQL table name for any item-type query, regardless of the "recordtype" value used elsewhere in the same response.
+- "filters" must always use the native [cond, "AND"/"OR", cond, ...] format, never a bare list of conditions when there's more than one.
+- "columns" must always be derived dynamically from what the user asked for — never hardcode a fixed list.
 - If a Saved Search may fail or is ambiguous, always provide "query" for SuiteQL fallback.
 """
 @app.route('/chat', methods=['POST'])

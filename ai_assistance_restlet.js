@@ -252,32 +252,51 @@ define([
     //     }
     // }
 function searchRecord(data) {
-    const { recordtype, filters = [], searchname = "AI Search", query } = data;
+    const { recordtype, searchtype, filters = [], columns = [], searchname = "AI Search" } = data;
     if (!recordtype) return { success: false };
+
+    // "searchtype" is the value the AI generated specifically for search.create({type}).
+    // It is NOT the same as "recordtype" (e.g. items must use "item", not "noninventoryitem").
+    // Fall back to recordtype only if the AI omitted searchtype (e.g. custom records).
+    const effectiveSearchType = searchtype || recordtype;
+
+    // Columns must come from the AI response — never hardcode to just internalid.
+    const effectiveColumns = (Array.isArray(columns) && columns.length > 0)
+        ? columns
+        : ['internalid'];
 
     try {
         const accountId = runtime.accountId;
 
-        // Try Saved Search first
         const savedSearch = search.create({
-            type: recordtype,
+            type: effectiveSearchType,
             title: `${searchname} - ${new Date().toISOString().slice(0,16)}`,
             filters: filters,
-            columns: ['internalid']
+            columns: effectiveColumns
         });
 
         const searchId = savedSearch.save();
 
         const searchLink = `https://${accountId}.app.netsuite.com/app/common/search/savedsearchresults.nl?searchid=${searchId}&whence=`;
 
+        // Get an actual result count instead of hardcoding 0
+        let resultCount = 0;
+        try {
+            resultCount = search.load({ id: searchId }).runPaged({ pageSize: 1000 }).count;
+        } catch (countErr) {
+            log.debug('Count Lookup Failed', countErr.message);
+        }
+
         return {
             success: true,
             operation: 'search',
             recordtype: recordtype,
+            searchtype: effectiveSearchType,
             searchName: savedSearch.title,
             searchId: searchId,
-            count: 0,
-            searchLink: searchLink
+            count: resultCount,
+            searchLink: searchLink,
+            columns: effectiveColumns
         };
     } catch (e) {
         log.error('Saved Search Failed - Using SuiteQL from AI', e.message);
@@ -287,35 +306,49 @@ function searchRecord(data) {
 
 // Execute SuiteQL Query from AI
 function executeSuiteQL(data) {
-    const { recordtype, searchname = "AI Search", query } = data;
+    const { recordtype, searchtype, searchname = "AI Search", query } = data;
     const accountId = runtime.accountId;
+    const effectiveSearchType = searchtype || recordtype;
 
     try {
         log.debug('Executing SuiteQL', query);
-        let sql = query || `SELECT id, name FROM ${recordtype} WHERE isinactive = 'F' LIMIT 50`;
+        // Fallback query, if the AI didn't provide one, must use the "item" table for item
+        // searchtypes (matches the SuiteQL rules in the system prompt) instead of recordtype.
+        const fallbackTable = effectiveSearchType === 'item' ? 'item'
+            : effectiveSearchType === 'transaction' ? 'transaction'
+            : effectiveSearchType;
+        let sql = query || `SELECT id, ${fallbackTable === 'item' ? 'itemid, displayname' : 'entityid'} FROM ${fallbackTable} WHERE isinactive = 'F' LIMIT 50`;
 
-        const resultSet = search.create({
+        const suiteQLResult = search.create({
             type: search.Type.FREEFORM,
             query: sql
         }).run();
 
-        log.debug('SuiteQL ResultSet', resultSet);
-        const results = resultSet.getRange({ start: 0, end: 20 });
+        log.debug('SuiteQL ResultSet', suiteQLResult);
+        const results = suiteQLResult.getRange({ start: 0, end: 50 });
 
-        const searchLink = `https://${accountId}.app.netsuite.com/app/common/search/savedsearchresults.nl?searchtype=${recordtype}`;
+        // Read whichever columns actually came back from the query, instead of
+        // hardcoding a fixed field name — the SELECT list is fully dynamic from the AI.
+        const columnNames = suiteQLResult.columns.map(c => c.name);
+
+        const searchLink = `https://${accountId}.app.netsuite.com/app/common/search/savedsearchresults.nl?searchtype=${effectiveSearchType}`;
 
         return {
             success: true,
             operation: 'search',
             recordtype: recordtype,
+            searchtype: effectiveSearchType,
             searchName: searchname + " (SuiteQL)",
             searchId: null,
             count: results.length,
             searchLink: searchLink,
-            results: results.map(r => ({
-                id: r.id,
-                name: r.getValue('name')
-            }))
+            results: results.map(r => {
+                const row = { id: r.id };
+                columnNames.forEach(col => {
+                    row[col] = r.getValue({ name: col });
+                });
+                return row;
+            })
         };
     } catch (e) {
         log.error('SuiteQL Execution Failed', e);
